@@ -7,6 +7,11 @@ from libcpp.pair cimport pair
 
 include "config.pxi"
 
+cdef extern from "py_callable_wrapper.h" namespace "SymEngine":
+    cdef cppclass PyCallableWrapper:
+        PyCallableWrapper()
+        PyCallableWrapper(object)
+
 cdef extern from 'symengine/mp_class.h' namespace "SymEngine":
     ctypedef unsigned long mp_limb_t
     ctypedef struct __mpz_struct:
@@ -184,11 +189,15 @@ cdef extern from "<symengine/basic.h>" namespace "SymEngine":
         vec_basic get_args() nogil
         int __cmp__(const Basic &o) nogil
     ctypedef RCP[const Number] rcp_const_number "SymEngine::RCP<const SymEngine::Number>"
+    ctypedef map[rcp_const_basic, rcp_const_number] map_basic_num "SymEngine::map_basic_num"
+    ctypedef map[rcp_const_basic, rcp_const_number].iterator map_basic_num_iterator "SymEngine::map_basic_num::iterator"
     ctypedef unordered_map[int, rcp_const_basic] umap_int_basic "SymEngine::umap_int_basic"
     ctypedef unordered_map[int, rcp_const_basic].iterator umap_int_basic_iterator "SymEngine::umap_int_basic::iterator"
     ctypedef unordered_map[rcp_const_basic, rcp_const_number] umap_basic_num "SymEngine::umap_basic_num"
     ctypedef unordered_map[rcp_const_basic, rcp_const_number].iterator umap_basic_num_iterator "SymEngine::umap_basic_num::iterator"
     ctypedef vector[pair[rcp_const_basic, rcp_const_basic]] vec_pair "SymEngine::vec_pair"
+    ctypedef unordered_map[rcp_const_basic, rcp_const_number] add_operands_map "SymEngine::add_operands_map"
+    ctypedef unordered_map[rcp_const_basic, rcp_const_number].iterator add_operands_map_iterator "SymEngine::add_operands_map::iterator"
 
     bool eq(const Basic &a, const Basic &b) nogil except +
     bool neq(const Basic &a, const Basic &b) nogil except +
@@ -224,6 +233,7 @@ cdef extern from "<symengine/basic.h>" namespace "SymEngine":
     RCP[const PyFunction] rcp_static_cast_PyFunction "SymEngine::rcp_static_cast<const SymEngine::PyFunction>"(rcp_const_basic &b) nogil
     RCP[const Boolean] rcp_static_cast_Boolean "SymEngine::rcp_static_cast<const SymEngine::Boolean>"(rcp_const_basic &b) nogil
     RCP[const Set] rcp_static_cast_Set "SymEngine::rcp_static_cast<const SymEngine::Set>"(rcp_const_basic &b) nogil
+    RCP[const DataBufferElement] rcp_static_cast_DataBufferElement "SymEngine::rcp_static_cast<const SymEngine::DataBufferElement>"(rcp_const_basic &b) nogil
     Ptr[RCP[Basic]] outArg(rcp_const_basic &arg) nogil
     Ptr[RCP[Integer]] outArg_Integer "SymEngine::outArg<SymEngine::RCP<const SymEngine::Integer>>"(RCP[const Integer] &arg) nogil
 
@@ -316,10 +326,12 @@ cdef extern from "<symengine/basic.h>" namespace "SymEngine":
     bool is_a_Not "SymEngine::is_a<SymEngine::Not>"(const Basic &b) nogil
     bool is_a_Or "SymEngine::is_a<SymEngine::Or>"(const Basic &b) nogil
     bool is_a_Xor "SymEngine::is_a<SymEngine::Xor>"(const Basic &b) nogil
+    bool is_a_DataBufferElement "SymEngine::is_a<SymEngine::DataBufferElement>"(const Basic &b) nogil
     rcp_const_basic expand(rcp_const_basic &o, bool deep) nogil except +
     void as_numer_denom(rcp_const_basic &x, const Ptr[RCP[Basic]] &numer, const Ptr[RCP[Basic]] &denom) nogil
     void as_real_imag(rcp_const_basic &x, const Ptr[RCP[Basic]] &real, const Ptr[RCP[Basic]] &imag) nogil
     void cse(vec_pair &replacements, vec_basic &reduced_exprs, const vec_basic &exprs) nogil except +
+    void cse(vec_pair &replacements, vec_basic &reduced_exprs, const vec_basic &exprs, PyCallableWrapper symbols) except +
 
 cdef extern from "<symengine/subs.h>" namespace "SymEngine":
     rcp_const_basic msubs (rcp_const_basic &x, const map_basic_basic &x) nogil
@@ -441,7 +453,7 @@ cdef extern from "<symengine/add.h>" namespace "SymEngine":
     cdef cppclass Add(Basic):
         void as_two_terms(const Ptr[RCP[Basic]] &a, const Ptr[RCP[Basic]] &b)
         RCP[const Number] get_coef()
-        const umap_basic_num &get_dict()
+        const add_operands_map &get_dict()
 
 cdef extern from "<symengine/mul.h>" namespace "SymEngine":
     cdef rcp_const_basic mul(rcp_const_basic &a, rcp_const_basic &b) nogil except+
@@ -785,6 +797,7 @@ cdef extern from "<symengine/matrix.h>" namespace "SymEngine":
         rcp_const_basic set(unsigned i, unsigned j, rcp_const_basic e) nogil
         string __str__() nogil except+
         bool eq(const MatrixBase &) nogil
+        unsigned int hash() nogil except +
         rcp_const_basic det() nogil
         void inv(MatrixBase &)
         bool is_square() nogil
@@ -914,6 +927,13 @@ cdef extern from "<symengine/ntheory.h>" namespace "SymEngine":
         sieve_iterator()
         sieve_iterator(unsigned limit) nogil
         unsigned next_prime() nogil
+
+cdef extern from "<symengine/data_buffer_element.h>" namespace "SymEngine":
+    cdef rcp_const_basic data_buffer_element(RCP[const Symbol] &name, rcp_const_basic &i) nogil except+
+
+    cdef cppclass DataBufferElement(Basic):
+        rcp_const_basic get_name() nogil
+        rcp_const_basic get_i() nogil
 
 cdef extern from "<symengine/visitor.h>" namespace "SymEngine":
     bool has_symbol(const Basic &b, const Symbol &x) nogil except +

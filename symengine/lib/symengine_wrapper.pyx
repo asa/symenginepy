@@ -1,9 +1,10 @@
 from cython.operator cimport dereference as deref, preincrement as inc
 cimport symengine
-from symengine cimport (RCP, pair, map_basic_basic, umap_int_basic,
+from symengine cimport (RCP, pair, add_operands_map, add_operands_map_iterator,
+    map_basic_basic, umap_int_basic,
     umap_int_basic_iterator, umap_basic_num, umap_basic_num_iterator,
     rcp_const_basic, std_pair_short_rcp_const_basic,
-    rcp_const_seriescoeffinterface, CRCPBasic)
+    rcp_const_seriescoeffinterface, CRCPBasic, PyCallableWrapper)
 from libcpp cimport bool as cppbool
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -31,6 +32,11 @@ except ImportError:
     have_numpy = False
 
 include "config.pxi"
+
+# whether or not to allow eval of arguments when constructing sympy objects in class _sympy_ methods
+# if disabled, _sympy_ becomes much faster, thus speeding up symforce codegen
+# it has the downside of missing some small simplifications that can happen
+__EVAL_ON_SYMPY__ = True
 
 class SympifyError(Exception):
     pass
@@ -257,6 +263,8 @@ cdef object c2py(rcp_const_basic o):
         r = Boolean.__new__(Xor)
     elif (symengine.is_a_UnevaluatedExpr(deref(o))):
         r = Function.__new__(UnevaluatedExpr)
+    elif (symengine.is_a_DataBufferElement(deref(o))):
+        r = Expr.__new__(DataBufferElement)
     else:
         raise Exception("Unsupported SymEngine class.")
     r.thisptr = o
@@ -272,6 +280,7 @@ def sympy2symengine(a, raise_error=False):
     """
     import sympy
     from sympy.core.function import AppliedUndef as sympy_AppliedUndef
+    from sympy.matrices.expressions import matexpr
     if isinstance(a, sympy.Symbol):
         return Symbol(a.name)
     elif isinstance(a, sympy.Dummy):
@@ -416,6 +425,8 @@ def sympy2symengine(a, raise_error=False):
         return sign(a.args[0])
     elif isinstance(a, sympy.floor):
         return floor(a.args[0])
+    elif isinstance(a, sympy.Mod):
+        return Mod(*a.args)
     elif isinstance(a, sympy.ceiling):
         return ceiling(a.args[0])
     elif isinstance(a, sympy.conjugate):
@@ -483,6 +494,13 @@ def sympy2symengine(a, raise_error=False):
             raise NotImplementedError
     elif isinstance(a, sympy.polys.domains.modularinteger.ModularInteger):
         return PyNumber(a, sympy_module)
+    elif isinstance(a, sympy.MatrixSymbol):
+        return DataBuffer(a.name, a.shape[0], a.shape[1])
+    elif isinstance(a, matexpr.MatrixElement):
+        # args is (parent (MatrixElement), row_index, col_index)
+        assert a.args[0].cols == 1 or a.args[0].rows == 1, "sympy2symengine: can only conver 1-D MatrixElement"
+        inx = a.args[1] * a.args[0].cols + a.args[2]
+        return DataBufferElement(a.args[0].name, inx)
     elif sympy.__version__ > '1.0':
         if isinstance(a, sympy.acsch):
             return acsch(a.args[0])
@@ -768,12 +786,13 @@ class DictBasic(_DictBasic, MutableMapping):
     def __repr__(self):
         return self.__str__()
 
-def get_dict(*args):
+def get_dict(*args, **kwargs):
     """
     Returns a DictBasic instance from args. Inputs can be,
         1. a DictBasic
         2. a Python dictionary
         3. two args old, new
+    NOTE(harrison): **kwargs are so we can share function signatures with the one we patch in
     """
     cdef _DictBasic D = DictBasic()
     if len(args) == 2:
@@ -791,7 +810,12 @@ def get_dict(*args):
     if isinstance(arg, DictBasic):
         return arg
     for k, v in arg.items():
-        D.add(k, v)
+        if not isinstance(k, str) and k.is_Matrix:
+            assert k.shape == v.shape
+            for k_i, v_i in zip(k, v):
+                D.add(k_i, v_i)
+        else:
+            D.add(k, v)
     return D
 
 
@@ -930,8 +954,8 @@ cdef class Basic(object):
         warnings.warn("subs_oldnew() is deprecated. Use subs() instead", DeprecationWarning)
         return self.subs({old: new})
 
-    def subs(Basic self not None, *args):
-        cdef _DictBasic D = get_dict(*args)
+    def subs(Basic self not None, *args, **kwargs):
+        cdef _DictBasic D = get_dict(*args, **kwargs)
         return c2py(symengine.ssubs(self.thisptr, D.c))
 
     def xreplace(Basic self not None, *args):
@@ -954,7 +978,7 @@ cdef class Basic(object):
         symengine.as_real_imag(self.thisptr, symengine.outArg(_real), symengine.outArg(_imag))
         return c2py(<rcp_const_basic>_real), c2py(<rcp_const_basic>_imag)
 
-    def n(self, unsigned long prec = 53, real=None):
+    def n(self, unsigned long prec = 53, real=True):
         return evalf(self, prec, real)
 
     evalf = n
@@ -1080,6 +1104,11 @@ cdef class Basic(object):
     @property
     def is_real(self):
         return is_real(self)
+
+
+    @property
+    def is_DataBufferElement(self):
+        return False
 
     def copy(self):
         return self
@@ -2151,13 +2180,13 @@ class Add(AssocOp):
 
     def as_coefficients_dict(Basic self):
         cdef RCP[const symengine.Add] X = symengine.rcp_static_cast_Add(self.thisptr)
-        cdef umap_basic_num umap
-        cdef umap_basic_num_iterator iter, iterend
+        cdef add_operands_map map
+        cdef add_operands_map_iterator iter, iterend
         d = collections.defaultdict(int)
         d[Integer(1)] = c2py(<rcp_const_basic>(deref(X).get_coef()))
-        umap = deref(X).get_dict()
-        iter = umap.begin()
-        iterend = umap.end()
+        map = deref(X).get_dict()
+        iter = map.begin()
+        iterend = map.end()
         while iter != iterend:
             d[c2py(<rcp_const_basic>(deref(iter).first))] =\
                     c2py(<rcp_const_basic>(deref(iter).second))
@@ -2254,6 +2283,70 @@ class Pow(Expr):
     def func(self):
         return self.__class__
 
+class DataBufferElement(Expr):
+    """
+    Represents an index into an external memory buffer.
+    """
+    def __new__(cls, name, i):
+        cdef Basic s_name = sympify(name)
+        cdef Basic s_i = sympify(i)
+        cdef RCP[const symengine.Symbol] s_name_sym = symengine.rcp_static_cast_Symbol(s_name.thisptr)
+        return c2py(symengine.data_buffer_element(s_name_sym, s_i.thisptr))
+
+    @property
+    def name(Basic self):
+        cdef RCP[const symengine.DataBufferElement] X = symengine.rcp_static_cast_DataBufferElement(self.thisptr)
+        return c2py(deref(X).get_name())
+
+    @property
+    def i(Basic self):
+        cdef RCP[const symengine.DataBufferElement] X = symengine.rcp_static_cast_DataBufferElement(self.thisptr)
+        return c2py(deref(X).get_i())
+
+    @property
+    def is_DataBufferElement(self):
+        return True
+
+    def _sympy_(Basic self):
+        cdef RCP[const symengine.DataBufferElement] X = symengine.rcp_static_cast_DataBufferElement(self.thisptr)
+        name = c2py(deref(X).get_name())
+        i = c2py(deref(X).get_i())
+        import sympy
+        # Immediately index into the MatrixSymbol so we're returning a Matrix Element
+        # This is a bit of a hack to get a MatrixElement w/ a MatrixSymbol parent.
+        # Since in printing we only care about size[1], the size symbol doesn't matter
+        return sympy.MatrixSymbol(name.name, sympy.Symbol('size'), 1)[i._sympy_(), 0]
+
+class DataBuffer(Symbol):
+    """
+    Represents an external one-dimensional data buffer that can be indexed.
+    """
+    def __init__(self, name, rows=None):
+        super(DataBuffer, self).__init__(name)
+        self.shape = (rows, 1)
+
+    # We do not want DataBuffers to be iterable since they can have symbolic dimensions
+    # since we implement __getitem__ we need to explicitly implement __iter__ and throw an error
+    def __iter__(self):
+        raise TypeError("DataBuffer object is not iterable")
+
+    def __getitem__(self, args):
+        arg_len = 0
+        if hasattr(args, '__len__'):
+            arg_len = len(args)
+
+        if arg_len == 0:
+            inx = args
+        elif arg_len == 1:
+            inx = args[0]
+        # since we only support 1-D buffer, only allow [i,0] indexing
+        elif arg_len == 2 and args[1] == 0:
+            inx = args[0]
+        else:
+            raise NotImplementedError('DataBuffer is one-dimensional!')
+        return DataBufferElement(self, inx)
+
+
 
 class Function(Expr):
 
@@ -2279,7 +2372,7 @@ class OneArgFunction(Function):
 
     def _sympy_(self):
         import sympy
-        return getattr(sympy, self.__class__.__name__)(self.get_arg()._sympy_())
+        return getattr(sympy, self.__class__.__name__)(self.get_arg()._sympy_(), evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2316,7 +2409,7 @@ class zeta(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.zeta(*self.args_as_sympy())
+        return sympy.zeta(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
 class dirichlet_eta(OneArgFunction):
     def __new__(cls, x):
@@ -2331,7 +2424,7 @@ class KroneckerDelta(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.KroneckerDelta(*self.args_as_sympy())
+        return sympy.KroneckerDelta(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2344,7 +2437,7 @@ class LeviCivita(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.LeviCivita(*self.args_as_sympy())
+        return sympy.LeviCivita(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
 class erf(OneArgFunction):
     def __new__(cls, x):
@@ -2364,7 +2457,7 @@ class lowergamma(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.lowergamma(*self.args_as_sympy())
+        return sympy.lowergamma(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2378,7 +2471,7 @@ class uppergamma(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.uppergamma(*self.args_as_sympy())
+        return sympy.uppergamma(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2401,7 +2494,7 @@ class beta(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.beta(*self.args_as_sympy())
+        return sympy.beta(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2415,7 +2508,7 @@ class polygamma(Function):
 
     def _sympy_(self):
         import sympy
-        return sympy.polygamma(*self.args_as_sympy())
+        return sympy.polygamma(*self.args_as_sympy(), evaluate=__EVAL_ON_SYMPY__)
 
 class sign(OneArgFunction):
 
@@ -2435,6 +2528,10 @@ class floor(OneArgFunction):
     def __new__(cls, x):
         cdef Basic X = sympify(x)
         return c2py(symengine.floor(X.thisptr))
+
+# TODO(hayk): Actually put into C++
+def Mod(number, divisor):
+    return number - (floor(number / divisor) * divisor)
 
 class ceiling(OneArgFunction):
     def __new__(cls, x):
@@ -2584,6 +2681,10 @@ class atan2(Function):
         cdef Basic Y = sympify(y)
         return c2py(symengine.atan2(X.thisptr, Y.thisptr))
 
+    def _sympy_(self):
+        import sympy
+        return sympy.atan2(*self.args, evaluate=__EVAL_ON_SYMPY__)
+
 # For backwards compatibility
 
 Sin = sin
@@ -2650,10 +2751,12 @@ class Abs(OneArgFunction):
         cdef Basic X = sympify(x)
         return c2py(symengine.abs(X.thisptr))
 
-    def _sympy_(Basic self):
-        cdef RCP[const symengine.Abs] X = symengine.rcp_static_cast_Abs(self.thisptr)
-        arg = c2py(deref(X).get_arg())._sympy_()
-        return abs(arg)
+    # NOTE(harrison): I have no clue why this doesn't just use the parent _sympy_
+    # using this implementation forces a sympy eval which is horrendously slow
+    # def _sympy_(Basic self):
+    #     cdef RCP[const symengine.Abs] X = symengine.rcp_static_cast_Abs(self.thisptr)
+    #     arg = c2py(deref(X).get_arg())._sympy_()
+    #     return abs(arg)
 
     def _sage_(Basic self):
         cdef RCP[const symengine.Abs] X = symengine.rcp_static_cast_Abs(self.thisptr)
@@ -2802,7 +2905,7 @@ class Max(Function):
     def _sympy_(self):
         import sympy
         s = self.args_as_sympy()
-        return sympy.Max(*s)
+        return sympy.Max(*s, evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2821,7 +2924,7 @@ class Min(Function):
     def _sympy_(self):
         import sympy
         s = self.args_as_sympy()
-        return sympy.Min(*s)
+        return sympy.Min(*s, evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         import sage.all as sage
@@ -2941,7 +3044,7 @@ class Piecewise(Function):
         l = []
         for i in range(0, len(a), 2):
             l.append((a[i]._sympy_(), a[i + 1]._sympy_()))
-        return sympy.Piecewise(*l)
+        return sympy.Piecewise(*l, evaluate=__EVAL_ON_SYMPY__)
 
 
 cdef class Set(Expr):
@@ -3120,9 +3223,8 @@ cdef class MatrixBase:
     def _symbolic_(self, ring):
         return ring(self._sage_())
 
-    # TODO: fix this
     def __hash__(self):
-        return 0
+        return deref(self.thisptr).hash()
 
 
 class MatrixError(Exception):
@@ -3351,6 +3453,17 @@ cdef class DenseMatrixBase(MatrixBase):
                         continue
                     except TypeError:
                         pass
+                    # NOTE(brad): If, for example, value = [np.float64(1)], r = 0, c = 0,
+                    # then value[r][c] is np.float64(1)[0], which raises an IndexError error,
+                    # not a TypeError (likely because np.float64(1) is considered a 0-dim array).
+                    # Otherwise, we do still want to raise the IndexError.
+                    # Since numpy may not be imported, I instead check if the shape attribute is
+                    # that of a 0-dim array.
+                    except IndexError as e:
+                        if hasattr(value[r], "shape") and value[r].shape == ():
+                            pass
+                        else:
+                            raise e
 
                     if len(row_iter) == 1:
                         self.set(row, col, value[c])
@@ -3649,9 +3762,13 @@ cdef class DenseMatrixBase(MatrixBase):
         return diff(self, *args)
 
     #TODO: implement this in C++
-    def subs(self, *args):
-        cdef _DictBasic D = get_dict(*args)
-        return self.applyfunc(lambda x: x.subs(D))
+    def subs(self, *args, **kwargs):
+        cdef _DictBasic D = get_dict(*args, **kwargs)
+
+        def subs_inner(Basic x not None):
+            return c2py(symengine.ssubs(x.thisptr, D.c))
+
+        return self.applyfunc(subs_inner)
 
     def xreplace(self, *args):
         cdef _DictBasic D = get_dict(*args)
@@ -3764,7 +3881,7 @@ cdef class DenseMatrixBase(MatrixBase):
                 l.append(c2py(A.get(i, j))._sympy_())
             s.append(l)
         import sympy
-        return sympy.Matrix(s)
+        return sympy.Matrix(s, evaluate=__EVAL_ON_SYMPY__)
 
     def _sage_(self):
         s = []
@@ -5311,7 +5428,30 @@ def linsolve(eqs, syms):
     return vec_basic_to_tuple(ret)
 
 
-def cse(exprs):
+def cse(exprs, symbols=None):
+    """
+    Perform common subexpression elimination on an expression.
+
+    Parameters
+    ==========
+
+    exprs : iterable of symengine expressions
+        The expressions to reduce.
+    symbols : infinite iterator yielding unique Symbols
+        The symbols used to label the common subexpressions which are pulled
+        out. The default is a stream of symbols of the form "x0", "x1", etc.
+        This must be an infinite iterator.
+
+    Returns
+    =======
+
+    replacements : list of (Symbol, expression) pairs
+        All of the common subexpressions that were replaced. Subexpressions
+        earlier in this list might show up in subexpressions later in this
+        list.
+    reduced_exprs : list of symengine expressions
+        The reduced expressions with all of the replacements above.
+    """
     cdef symengine.vec_basic vec
     cdef symengine.vec_pair replacements
     cdef symengine.vec_basic reduced_exprs
@@ -5319,7 +5459,21 @@ def cse(exprs):
     for expr in exprs:
         b = sympify(expr)
         vec.push_back(b.thisptr)
-    symengine.cse(replacements, reduced_exprs, vec)
+    if symbols is None:
+        symengine.cse(replacements, reduced_exprs, vec)
+    else:
+        iterator = iter(symbols)
+        def generator():
+            # We pull out the name here and convert back to a Symbol in
+            # PyCallableWrapper.  Fixing this would introduce a dependency cycle
+            # between symengine.pxd and py_callable_wrapper, since we'd need to be
+            # able to pull an RCP<Symbol> out of the python object returned from within
+            # PyCallableWrapper.  We could probably break this cycle, but that would
+            # require a large refactor of these files.  This should be fine and isn't
+            # too slow, but it does mean we lose information of whether this is
+            # actually a subclass of Symbol.
+            return next(iterator).name
+        symengine.cse(replacements, reduced_exprs, vec, PyCallableWrapper(generator))
     return (vec_pair_to_list(replacements), vec_basic_to_list(reduced_exprs))
 
 def latex(expr):
