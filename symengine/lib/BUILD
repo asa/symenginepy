@@ -53,7 +53,8 @@ cc_library(
         ".",
     ],
     deps = [
-        "@python",
+        "@python_3_12//:libpython",
+        "@python_3_12//:python_headers",
         "@symengine_repo//:symengine",
     ],
 )
