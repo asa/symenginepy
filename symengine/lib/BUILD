@@ -1,4 +1,5 @@
 load("@cython_repo//Tools:rules.bzl", "pyx_library")
+load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_symforce//symengine_tools:config.bzl", "symenginepy_config")
 load("@rules_symforce//symengine_tools:python.bzl", "cython_add_module_pyx")
 

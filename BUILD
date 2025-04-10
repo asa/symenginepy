@@ -1,9 +1,10 @@
+load("@rules_python//python:py_library.bzl", "py_library")
+
 package(default_visibility = ["//visibility:public"])
 
 py_library(
-        name = "symenginepy",
-        deps = [
-             "//symengine",
-        ],
+    name = "symenginepy",
+    deps = [
+        "//symengine",
+    ],
 )
-
